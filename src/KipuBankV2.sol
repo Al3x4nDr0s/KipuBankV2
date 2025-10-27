@@ -2,179 +2,285 @@
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol"; // Interfaz de Chainlink
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 
 /// @title KipuBankV2
 /// @author Alejandro Cardenas
-/// @notice Un banco avanzado que soporta depósitos y retiros de ETH y cualquier token ERC-20,
-/// @notice con un límite de depósito dinámico controlado por Chainlink Data Feeds.
+/// @notice An advanced bank contract supporting deposits and withdrawals of native tokens (ETH) and ERC-20 tokens.
+/// @notice It features a dynamic deposit limit (in $USD) controlled by Chainlink Data Feeds.
 contract KipuBankV2 is Ownable {
+
+    /*///////////////////////////////////////////////////////////////
+                           TYPES AND CONSTANTS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev address(0) is used to represent the native token (ETH).
+    address private constant NATIVE_TOKEN = address(0);
+
+    /// @notice The global deposit limit for the bank, fixed in USD (e.g., $10,000,000 with 6 decimals).
+    /// @dev We use 6 decimals for the internal USD cap to align with stablecoin standards (e.g., USDC).
+    uint256 public constant USD_BANK_CAP = 10_000_000e6; // $10,000,000 * 10^6
+
+    /// @notice The number of decimals used for our USD bank cap.
+    uint8 public constant USD_CAP_DECIMALS = 6;
 
     /*///////////////////////////////////////////////////////////////
                               STATE VARIABLES
     //////////////////////////////////////////////////////////////*/
 
-    // Constantes
-    /// @notice El límite global de depósito del banco, fijado en USD (por ejemplo, $10,000,000 con 6 decimales).
-    uint256 public constant USD_BANK_CAP = 10_000_000e6; // $10M, asumiendo 6 decimales para coherencia con oráculos comunes. 
-    
-    // Variables Inmutables
-    /// @notice La dirección del Data Feed de Chainlink para el par ETH/USD. [cite: 89]
+    /// @notice The address of the Chainlink Data Feed for the ETH/USD pair.
     AggregatorV3Interface private immutable s_priceFeed;
-    /// @notice El máximo permitido a retirar por transacción (en Wei para ETH, o en la unidad base del ERC-20). [cite: 6]
+
+    /// @notice The maximum amount allowed to be withdrawn per transaction (in the token's base unit).
+    /// @dev This cap applies to all supported tokens.
     uint256 public immutable transactionWithdrawalCap;
 
-    // Contabilidad Multi-token (Mapping Anidado)
-    /// @notice Mapping anidado de direcciones de usuario a direcciones de token, a su saldo (en la unidad base del token).
-    /// @dev address(0) se usa para representar el token nativo (ETH). [cite: 77, 91]
-    mapping(address => mapping(address => uint256)) private userVaults; // 
+    /// @notice Nested mapping from user address -> token address -> balance (in token's base unit).
+    /// @dev NATIVE_TOKEN (address(0)) is used for ETH.
+    mapping(address => mapping(address => uint256)) private userVaults;
 
-    // ... (TotalDeposits y TotalWithdrawals se mantienen) ...
+    /// @notice Total count of successful deposits made.
+    uint256 public totalDeposits;
+
+    /// @notice Total count of successful withdrawals made.
+    uint256 public totalWithdrawals;
 
     /*///////////////////////////////////////////////////////////////
-                           CUSTOM ERRORS (Se mantienen los originales y se añaden, si es necesario)
+                           CUSTOM ERRORS
     //////////////////////////////////////////////////////////////*/
+
+    /// @notice Emitted when a deposit exceeds the established global bank cap (in Wei/Token Base Unit).
+    error DepositExceedsBankCap(uint256 depositAmount, uint256 currentContractBalance, uint256 currentCap);
+
+    /// @notice Emitted when the user's balance is insufficient for the requested withdrawal.
+    error InsufficientBalance(uint256 requestedAmount, uint256 userBalance);
+
+    /// @notice Emitted when a withdrawal exceeds the per-transaction limit.
+    error WithdrawalExceedsCap(uint256 requestedAmount, uint256 transactionWithdrawalCap);
     
-    error InvalidToken();
-    // ...
+    /// @notice Emitted when the transfer of Ether or Token fails during a withdrawal.
+    error TransferFailed();
+
+    /// @notice Emitted when a zero amount is deposited or withdrawn.
+    error ZeroAmount();
+
+    /// @notice Emitted when an ERC20 deposit is attempted using the native function, or vice-versa.
+    error InvalidTokenFunction();
+    
+    /// @notice Emitted when Chainlink or other critical calculations fail.
+    error CalculationFailed();
+    
+    /*///////////////////////////////////////////////////////////////
+                               EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Emitted when a user successfully deposits funds.
+    /// @param depositor The address that made the deposit.
+    /// @param token The address of the token deposited (address(0) for ETH).
+    /// @param amount The amount deposited.
+    /// @param newBalance The user's new balance.
+    event DepositMade(address indexed depositor, address indexed token, uint256 amount, uint256 newBalance);
+
+    /// @notice Emitted when a user successfully withdraws funds.
+    /// @param withdrawer The address that performed the withdrawal.
+    /// @param token The address of the token withdrawn (address(0) for ETH).
+    /// @param amount The amount withdrawn.
+    /// @param newBalance The user's new balance.
+    event WithdrawalMade(address indexed withdrawer, address indexed token, uint256 amount, uint256 newBalance);
 
     /*///////////////////////////////////////////////////////////////
                             CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
-    /// @param _priceFeedAddress Dirección del Chainlink ETH/USD Data Feed.
-    /// @param _transactionWithdrawalCap Límite de retiro por transacción.
+    /// @dev Initializes the contract with the required price feed and withdrawal cap. Implements Ownable.
+    /// @param _priceFeedAddress The address of the Chainlink ETH/USD Data Feed.
+    /// @param _transactionWithdrawalCap The maximum withdrawal amount per transaction.
     constructor(
         address _priceFeedAddress,
         uint256 _transactionWithdrawalCap
-    ) Ownable(msg.sender) { // Inicializa Ownable con el desplegador como Owner. 
-        require(_priceFeedAddress != address(0), "Invalid price feed address");
+    ) Ownable(msg.sender) { // Initializes Ownable with the deployer as the Owner
+        if (_priceFeedAddress == address(0)) revert CalculationFailed(); 
         s_priceFeed = AggregatorV3Interface(_priceFeedAddress);
-        transactionWithdrawalCap = _transactionWithdrawalCap;
+        transactionWithdrawalCap = _transactionWithdrawalCap; // Set immutable variable
     }
 
     /*///////////////////////////////////////////////////////////////
-                            FUNCIONES DE VISUALIZACIÓN
+                            VIEW FUNCTIONS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Obtiene el saldo del usuario para un token específico. [cite: 52]
-    /// @param _user La dirección del usuario.
-    /// @param _token La dirección del token (address(0) para ETH).
-    /// @return El saldo del usuario.
+    /// @notice Gets the vault balance of a specific user for a given token.
+    /// @param _user The address of the user.
+    /// @param _token The address of the token (NATIVE_TOKEN for ETH).
+    /// @return The user's current balance (in the token's base unit).
     function getBalance(address _user, address _token) external view returns (uint256) {
         return userVaults[_user][_token];
     }
 
+    /// @notice Returns the current dynamic bank cap in the native token's base unit (Wei).
+    /// @return The current global bank cap in Wei.
+    function getCurrentBankCapInWei() public view returns (uint256) {
+        return _convertUSDCapToTokenBaseUnit(s_priceFeed, NATIVE_TOKEN);
+    }
+
     /*///////////////////////////////////////////////////////////////
-                            FUNCIONES AUXILIARES
+                            HELPER AND CONVERSION FUNCTIONS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Obtiene el precio actual de ETH/USD del oráculo de Chainlink. 
-    /// @return El precio de ETH/USD.
-    function _getLatestPrice() private view returns (int256) {
+    /// @notice Converts the fixed USD_BANK_CAP to the native token's base unit (Wei) using the Chainlink oracle.
+    /// @dev This function handles all decimal conversions for safety.
+    /// @param _priceFeed The price oracle for the pair (e.g., ETH/USD).
+    /// @param _token The address of the token (must be NATIVE_TOKEN for this logic).
+    /// @return The calculated bank cap in the token's base unit (Wei).
+    function _convertUSDCapToTokenBaseUnit(
+        AggregatorV3Interface _priceFeed,
+        address _token
+    ) private view returns (uint256) {
+        // This complex logic only applies to the native token cap
+        if (_token != NATIVE_TOKEN) revert CalculationFailed();
+
+        // 1. Get the price of ETH/USD from the oracle
         (
             ,
-            int256 price, // El valor del precio
+            int256 price, // The price (e.g., 1500 * 10^8 if the price is 1500.00)
             ,
             ,
-        ) = s_priceFeed.latestRoundData();
-        // Nota: El precio se devuelve con 8 decimales, según el contrato de Chainlink.
-        return price;
-    }
+        ) = _priceFeed.latestRoundData();
 
-    /// @notice Convierte el USD_BANK_CAP (con 6 decimales) a Wei, basado en el precio ETH/USD. [cite: 79, 92]
-    /// @dev Maneja la conversión de decimales entre el CAP (6 dec) y el Oráculo (8 dec) y ETH (18 dec).
-    /// @return El límite bancario en Wei (18 decimales).
-    function _convertUSDCapToWei() private view returns (uint256) {
-        int256 ethUsdPrice = _getLatestPrice(); // 8 decimales
-        require(ethUsdPrice > 0, "Price feed returned non-positive value");
+        if (price <= 0) revert CalculationFailed(); 
         
-        // Fórmula de Conversión:
-        // Cap en Wei = (CAP_USD * 10^18) / (Precio_ETH_USD * 10^(18 - OraculoDec))
-        // Dado que USD_BANK_CAP tiene 6 decimales, es:
-        // Wei = (USD_BANK_CAP / 10^6) * 10^18 / (Price_ETH_USD / 10^8)
-        // Simplificado:
-        // Wei = (USD_BANK_CAP * 10^20) / Price_ETH_USD
-        
-        // USD_BANK_CAP tiene 6 decimales, así que se escala por 10^18/10^6 = 10^12
-        // El precio tiene 8 decimales.
+        // Standard Chainlink ETH/USD feeds use 8 decimals.
+        uint8 priceFeedDecimals = 8; 
+        uint8 tokenDecimals = 18; // ETH decimals
 
-        // Escalar el USD_BANK_CAP para que la multiplicación sea primero.
-        uint256 capWeiNumerator = USD_BANK_CAP * 10**(18 - 6); // Cap en USD con 18 decimales (escalado)
+        // 2. Scale the price and the CAP for safe division:
+        // Formula: Wei = (USD_BANK_CAP * 10^(TokenDecimals + PriceFeedDecimals - CapDecimals)) / Price
+        // In this case: Wei = (USD_BANK_CAP * 10^(18 + 8 - 6)) / Price
+        // Wei = (USD_BANK_CAP * 10^20) / Price
+
+        uint256 priceUint = uint256(price);
         
-        // Convertir el precio de int256 a uint256 y escalar para tener 18 decimales
-        uint256 priceScaled = uint256(ethUsdPrice) * 10**(18 - 8); // Precio en USD con 18 decimales (escalado)
-        
-        // Resultado final en Wei (18 decimales)
-        return capWeiNumerator / priceScaled; 
+        // Calculate the scale factor (18 + 8 - 6 = 20)
+        uint256 scaleFactor = (tokenDecimals + priceFeedDecimals) - USD_CAP_DECIMALS;
+
+        // Scale the numerator. Using unchecked for known-safe constant arithmetic.
+        uint256 capWeiNumerator;
+        unchecked {
+            capWeiNumerator = USD_BANK_CAP * (10 ** scaleFactor); 
+        }
+
+        // 3. Final result in the base unit (Wei)
+        return capWeiNumerator / priceUint; 
     }
 
     /*///////////////////////////////////////////////////////////////
-                            FUNCIONES TRANSACCIONALES
+                            PUBLIC TRANSACTIONAL FUNCTIONS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Permite a los usuarios depositar ETH en su bóveda. [cite: 29, 30]
-    function depositETH() external payable {
-        // ... (Revisión de ZeroAmount y otros checks)
+    /// @notice Allows users to deposit native token (ETH) into their personal vault.
+    function depositNative() external payable {
+        if (msg.value == 0) revert ZeroAmount();
         
-        // CHECK: Límite Bancario Dinámico (Solo aplica a ETH, ya que la contabilidad total es más compleja)
-        uint256 currentCapInWei = _convertUSDCapToWei();
-        uint256 futureContractBalance = address(this).balance + msg.value; // Balance del contrato después del depósito
-        
+        // CHECK: Dynamic Bank Cap (Applies only to the native token for simplicity)
+        uint256 currentCapInWei = getCurrentBankCapInWei();
+        uint256 futureContractBalance = address(this).balance + msg.value;
+
         if (futureContractBalance > currentCapInWei) {
-             // Usar un error nuevo para el cap dinámico si se prefiere, o el existente
-            revert DepositExceedsBankCap(msg.value, address(this).balance, currentCapInWei); // [cite: 32]
+            revert DepositExceedsBankCap(msg.value, address(this).balance, currentCapInWei);
         }
 
-        // EFFECTS
-        userVaults[msg.sender][address(0)] += msg.value; // ETH depositado
-        // ... (Actualización de totalDeposits y Evento)
+        // EFFECTS: (Update state BEFORE any external interaction)
+        // Nested mapping: userVaults[msg.sender][NATIVE_TOKEN]
+        userVaults[msg.sender][NATIVE_TOKEN] += msg.value;
+        
+        unchecked { 
+            totalDeposits++;
+        }
+
+        // Emit Event
+        emit DepositMade(msg.sender, NATIVE_TOKEN, msg.value, userVaults[msg.sender][NATIVE_TOKEN]);
     }
 
-    /// @notice Permite a los usuarios depositar tokens ERC-20. 
-    /// @param _token La dirección del token ERC-20.
-    /// @param _amount La cantidad de token a depositar.
+    /// @notice Allows users to deposit ERC-20 tokens.
+    /// @dev Users must approve the contract to spend the token beforehand.
+    /// @param _token The address of the ERC-20 token.
+    /// @param _amount The amount of token to deposit.
     function depositERC20(address _token, uint256 _amount) external {
-        require(_token != address(0), "Use depositETH for native token"); // No permitir address(0) aquí
-        require(_amount > 0, "Zero amount deposit not allowed");
-        // ... (Lógica de seguridad, ej. si el token está en una lista blanca)
+        if (_token == NATIVE_TOKEN) revert InvalidTokenFunction(); // Use depositNative
+        if (_amount == 0) revert ZeroAmount();
 
-        // INTERACTIONS (Transferencia de token del usuario al contrato)
-        // Se requiere que el usuario haya aprobado previamente el contrato.
-        // Se usaría la interfaz de ERC-20 para llamar a transferFrom.
-        // IERC20(_token).transferFrom(msg.sender, address(this), _amount);
-
-        // EFFECTS (Actualización de estado)
+        // EFFECTS (Update state BEFORE interaction)
         userVaults[msg.sender][_token] += _amount;
-        // ... (Evento)
+        
+        unchecked {
+            totalDeposits++;
+        }
+
+        // INTERACTIONS (Transfer token from user to contract)
+        // Checks-Effects-Interactions pattern
+        if (!IERC20(_token).transferFrom(msg.sender, address(this), _amount)) {
+            revert TransferFailed();
+        }
+
+        // Emit Event
+        emit DepositMade(msg.sender, _token, _amount, userVaults[msg.sender][_token]);
     }
 
-    /// @notice Permite a los usuarios retirar tokens (ETH o ERC-20). 
-    /// @param _token La dirección del token a retirar (address(0) para ETH).
-    /// @param _amount La cantidad a retirar.
+    /// @notice Allows users to withdraw tokens (ETH or ERC-20).
+    /// @param _token The address of the token to withdraw (NATIVE_TOKEN for ETH).
+    /// @param _amount The amount to withdraw.
     function withdraw(address _token, uint256 _amount) external {
-        // CHECKS (Withdrawal Cap y Balance) [cite: 42, 44]
+        // CHECKS
+        if (_amount == 0) revert ZeroAmount();
         if (_amount > transactionWithdrawalCap) {
-             revert WithdrawalExceedsCap(_amount, transactionWithdrawalCap);
+             revert WithdrawalExceedsCap(_amount, transactionWithdrawalCap); // Per-transaction limit
         }
+        
+        // Insufficient balance check
         uint256 userBalance = userVaults[msg.sender][_token];
         if (_amount > userBalance) {
-             revert InsufficientBalance(_amount, userBalance);
+             revert InsufficientBalance(_amount, userBalance); 
         }
 
-        // EFFECTS (Actualizar estado ANTES de la interacción) [cite: 46]
+        // EFFECTS (Update state BEFORE interaction)
         userVaults[msg.sender][_token] = userBalance - _amount; 
 
-        // INTERACTIONS (Transferencia de token o ETH)
-        if (_token == address(0)) {
-            // Retiro de ETH (Token nativo)
-            (bool success, ) = payable(msg.sender).call{value: _amount}(""); // [cite: 49]
-            if (!success) revert TransferFailed(); // [cite: 50]
-        } else {
-            // Retiro de ERC-20
-            // Se usaría la interfaz de ERC-20 para llamar a transfer.
-            // IERC20(_token).transfer(msg.sender, _amount);
+        unchecked {
+            totalWithdrawals++;
         }
-        // ... (Actualización de totalWithdrawals y Evento)
+
+        // INTERACTIONS (Transfer)
+        bool success;
+        if (_token == NATIVE_TOKEN) {
+            // Native Token (ETH): Use call for secure transfer
+            (success, ) = payable(msg.sender).call{value: _amount}(""); 
+        } else {
+            // ERC-20 Token: Use transfer
+            success = IERC20(_token).transfer(msg.sender, _amount);
+        }
+
+        if (!success) {
+            revert TransferFailed(); // Revert state change if interaction fails.
+        }
+
+        // Emit Event
+        emit WithdrawalMade(msg.sender, _token, _amount, userVaults[msg.sender][_token]);
+    }
+    
+    /*///////////////////////////////////////////////////////////////
+                            ADMIN FUNCTIONS (OWNER ONLY)
+    //////////////////////////////////////////////////////////////*/
+    
+    /// @notice Allows the Owner to withdraw accidentally sent ERC20 tokens (e.g., tokens not supported by the bank).
+    /// @dev This function is for recovery and should NOT be used for native token (ETH) or supported ERC20 tokens.
+    /// @param _token The address of the stuck ERC20 token.
+    /// @param _amount The amount to withdraw.
+    function emergencyTokenWithdrawal(address _token, uint256 _amount) external onlyOwner {
+        if (_token == NATIVE_TOKEN) revert InvalidTokenFunction();
+        if (_amount == 0) revert ZeroAmount();
+
+        if (!IERC20(_token).transfer(owner(), _amount)) {
+            revert TransferFailed();
+        }
     }
 }
