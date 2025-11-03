@@ -91,7 +91,7 @@ contract KipuBankV2 is Ownable, ReentrancyGuard {
      * @param _priceFeedAddress Chainlink ETH/USD feed address.
      * @param _transactionWithdrawalCap Maximum allowed withdrawal per transaction.
      */
-    constructor(address _priceFeedAddress, uint256 _transactionWithdrawalCap) {
+    constructor(address _priceFeedAddress, uint256 _transactionWithdrawalCap) Ownable(msg.sender) {
         require(_priceFeedAddress != address(0), "priceFeed 0");
         priceFeed = AggregatorV3Interface(_priceFeedAddress);
         transactionWithdrawalCap = _transactionWithdrawalCap;
